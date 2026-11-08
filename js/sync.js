@@ -20,6 +20,8 @@ function eetSummary(){
     const o={};
     SLOTS.forEach(s=>{ const it=(x.meals[s.id]||[]).map(m=>m.t+prodTag(m.p)); if(it.length) o[s.id]=it; });
     const c={}; COUNTERS.forEach(k=>{ if(x.count[k.id]) c[k.id]=x.count[k.id]; }); if(Object.keys(c).length) o.tellers=c;
+    const dr={}; Object.keys(DRINK_TYPES).forEach(k=>{ if(x.count[k]) dr[k]=drinkSummary(x,k); }); if(Object.keys(dr).length) o.dranken=dr;
+    if(x.count.alcohol) o.standaardglazen=stdGlasses(x);
     if(x.feel) o.gevoel=x.feel;
     if(x.note) o.notitie=x.note;
     days[d]=o;

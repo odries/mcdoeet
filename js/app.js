@@ -19,6 +19,36 @@ const COUNTERS=[
   {id:"frisdrank", label:"Frisdrank",        unit:"glazen"},
   {id:"alcohol",   label:"Alcohol",          unit:"glazen"}
 ];
+/* soorten drank: tik + bij alcohol of frisdrank en kies wat je dronk.
+   std = Belgische standaardglazen (10 g alcohol); een zwaar bier telt dubbel. */
+const DRINK_TYPES={
+  alcohol:[
+    {id:"pils",l:"Pils",d:"25 cl",std:1},
+    {id:"zwaar",l:"Zwaar / speciaalbier",d:"Duvel, tripel…",std:2},
+    {id:"wijn",l:"Wijn",d:"glas",std:1},
+    {id:"bubbels",l:"Cava / bubbels",d:"glas",std:1},
+    {id:"sterk",l:"Sterke drank",d:"whisky, gin, jenever…",std:1},
+    {id:"cocktail",l:"Cocktail",d:"",std:2}
+  ],
+  frisdrank:[
+    {id:"suiker",l:"Frisdrank met suiker",d:"cola, fanta…"},
+    {id:"zero",l:"Zero / light",d:"zonder suiker"},
+    {id:"sap",l:"Fruitsap",d:""},
+    {id:"icetea",l:"Ice tea",d:""},
+    {id:"energie",l:"Energiedrank",d:""},
+    {id:"sport",l:"Sportdrank",d:""},
+    {id:"nulnul",l:"Alcoholvrij bier",d:"0.0"}
+  ]
+};
+function drinkLabel(k,id){ const t=(DRINK_TYPES[k]||[]).find(z=>z.id===id); return t?t.l:id; }
+/* lijst per soort: getypte drankjes + oude/ongetypte (van voor deze functie) */
+function drinkList(x,k){ const L=((x.drinks||{})[k]||[]).slice(); const extra=(x.count[k]||0)-L.length; for(let i=0;i<extra;i++) L.unshift("?"); return L; }
+function drinkSummary(x,k){
+  const c={}; drinkList(x,k).forEach(id=>{ c[id]=(c[id]||0)+1; });
+  return Object.keys(c).map(id=>c[id]+"× "+(id==="?"?"onbekend":drinkLabel(k,id).toLowerCase())).join(" · ");
+}
+function stdGlasses(x){ return drinkList(x,"alcohol").reduce((n,id)=>{ const t=DRINK_TYPES.alcohol.find(z=>z.id===id); return n+(t?t.std:1); },0); }
+let drinkOpen=null; // welke teller toont nu de keuzeknoppen
 const FEELS=[["goed","Goed"],["oke","Oké"],["minder","Minder"]];
 /* startsuggesties zolang de app nog niets geleerd heeft */
 const SEEDS={
@@ -139,28 +169,75 @@ function nsBadge(p,big){ return p&&p.ns?`<b class="ns ns-${p.ns}${big?" big":""}
 /* tekst voor de coach: kwaliteit wel, calorieën niet */
 function prodTag(p){ if(!p) return ""; const a=[]; if(p.ns) a.push("Nutri-Score "+p.ns.toUpperCase()); if(p.nova) a.push(NOVA[p.nova]); return a.length?" ["+a.join(", ")+"]":""; }
 
-/* camera-scanner: html5-qrcode wordt pas geladen als je echt scant */
-let scanner=null;
-function loadScript(src){ return new Promise((ok,ko)=>{ if(window.Html5Qrcode) return ok(); const e=document.createElement("script"); e.src=src; e.onload=ok; e.onerror=()=>ko(new Error("Kon de scanner niet laden (internet?)")); document.head.appendChild(e); }); }
+/* camera-scanner: eigen camerabeeld in hoge resolutie + barcode-detector (zxing in WebAssembly).
+   Safari heeft geen ingebouwde BarcodeDetector; dan laden we die pas als je echt scant.
+   Reserve: een foto nemen met de gewone camera (scherpere autofocus) en die laten lezen. */
+const FORMATS=["ean_13","ean_8","upc_a","upc_e"];
+let detector=null, cam=null; // cam = {stream, timer}
+async function getDetector(){
+  if(detector) return detector;
+  if("BarcodeDetector" in window){
+    try{ const f=await BarcodeDetector.getSupportedFormats(); if(f.includes("ean_13")) return detector=new BarcodeDetector({formats:FORMATS}); }catch(e){}
+  }
+  let m;
+  try{ m=await import("https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/ponyfill/+esm"); }
+  catch(e){ throw new Error("Kon de scanner niet laden (internet?)"); }
+  return detector=new m.BarcodeDetector({formats:FORMATS});
+}
+async function readCodes(src){
+  const det=await getDetector();
+  const r=await det.detect(src);
+  const hit=(r||[]).find(x=>/^\d{8,14}$/.test(x.rawValue||""));
+  return hit?hit.rawValue:null;
+}
 async function openScanner(){
   const host=$("scan"); host.hidden=false; document.body.classList.add("noscroll");
   host.innerHTML=`<div class="ov-top"><div class="ov-title">Scan barcode</div><button class="iconbtn" data-act="scanclose" aria-label="Sluiten">${CLOSE}</button></div>
-    <div class="sheet-in"><div id="reader"></div><div class="hint" id="scanmsg">Camera starten…</div>
+    <div class="sheet-in"><div id="reader"><video id="camvid" playsinline muted autoplay></video><i class="aim"></i></div>
+      <div class="hint" id="scanmsg">Camera starten…</div>
+      <label class="btn secondary photobtn">📷 Lukt het niet? Neem een foto van de barcode<input type="file" id="photoin" accept="image/*" capture="environment" hidden></label>
       <div class="lab">Of typ de cijfers onder de barcode</div>
       <form class="addrow" id="codeform" autocomplete="off"><input class="fld" id="codetxt" inputmode="numeric" placeholder="bv. 5410041001204"><button class="btn primary" type="submit">Zoek</button></form></div>`;
   $("codeform").addEventListener("submit",e=>{ e.preventDefault(); const v=$("codetxt").value; if(v.trim()) gotCode(v); });
+  $("photoin").addEventListener("change",async e=>{
+    const f=e.target.files[0]; e.target.value=""; if(!f) return;
+    const msg=$("scanmsg"); if(msg) msg.textContent="Foto lezen…";
+    try{
+      const bmp=await createImageBitmap(f);
+      const code=await readCodes(bmp);
+      if(code) gotCode(code); else if($("scanmsg")) $("scanmsg").textContent="Geen barcode gevonden op de foto. Probeer van wat dichterbij, recht ervoor, of typ de cijfers.";
+    }catch(err){ if($("scanmsg")) $("scanmsg").textContent=err.message||"Kon de foto niet lezen."; }
+  });
+  const msg=t=>{ const m=$("scanmsg"); if(m) m.textContent=t; };
   try{
-    await loadScript("https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js");
-    const F=Html5QrcodeSupportedFormats;
-    scanner=new Html5Qrcode("reader",{formatsToSupport:[F.EAN_13,F.EAN_8,F.UPC_A,F.UPC_E],verbose:false});
-    await scanner.start({facingMode:"environment"},{fps:10,qrbox:{width:260,height:130}},txt=>gotCode(txt),()=>{});
-    $("scanmsg").textContent="Hou de barcode in het kader.";
+    const detP=getDetector(); // alvast laden terwijl de camera start
+    const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}});
+    if($("scan").hidden){ stream.getTracks().forEach(t=>t.stop()); return; } // al gesloten
+    cam={stream,timer:null};
+    const tr=stream.getVideoTracks()[0];
+    try{ await tr.applyConstraints({advanced:[{focusMode:"continuous"}]}); }catch(e){}
+    const v=$("camvid"); v.srcObject=stream; await v.play().catch(()=>{});
+    await detP;
+    msg("Hou de barcode horizontaal in het kader, zo'n 10–15 cm van de camera.");
+    const cv=document.createElement("canvas"), cx=cv.getContext("2d",{willReadFrequently:true});
+    let busy=false;
+    cam.timer=setInterval(async()=>{
+      if(busy || !v.videoWidth) return; busy=true;
+      try{
+        // middelste band van het beeld (daar staat het kader) — kleiner = sneller
+        const w=v.videoWidth, h=v.videoHeight, bh=Math.round(h*.5);
+        cv.width=w; cv.height=bh; cx.drawImage(v,0,(h-bh)/2,w,bh,0,0,w,bh);
+        const code=await readCodes(cv);
+        if(code && cam) gotCode(code);
+      }catch(e){}
+      busy=false;
+    },250);
   }catch(e){
-    const m=$("scanmsg"); if(m) m.textContent=(e&&e.name==="NotAllowedError")?"Geen toegang tot de camera. Typ de code hieronder, of geef toegang in de instellingen van je iPhone.":(e.message||"Camera niet beschikbaar")+" — typ de code hieronder.";
+    msg((e&&e.name==="NotAllowedError")?"Geen toegang tot de camera. Neem een foto of typ de code; toegang geven kan in Instellingen › Safari › Camera.":(e.message||"Camera niet beschikbaar")+" — neem een foto of typ de code.");
   }
 }
 async function closeScanner(){
-  if(scanner){ try{ await scanner.stop(); }catch(e){} try{ scanner.clear(); }catch(e){} scanner=null; }
+  if(cam){ clearInterval(cam.timer); cam.stream.getTracks().forEach(t=>t.stop()); cam=null; }
   const host=$("scan"); host.hidden=true; host.innerHTML=""; if(!sheet) document.body.classList.remove("noscroll");
 }
 let lookingUp=false;
@@ -230,10 +307,13 @@ function renderToday(){
   });
 
   h+=`<section class="tile t-blue"><div class="tl"><span>Drinken & extra's</span><span>tik + of −</span></div>
-    ${COUNTERS.map(c=>{ const v=x.count[c.id]||0; return `<div class="ctr"><div class="cn">${c.label}<small>${c.unit}</small></div>
+    ${COUNTERS.map(c=>{ const v=x.count[c.id]||0, typed=!!DRINK_TYPES[c.id], open=typed&&drinkOpen===c.id;
+      const sub = typed&&v ? drinkSummary(x,c.id) : c.unit;
+      return `<div class="ctr${open?" open":""}"><div class="cn">${c.label}<small>${esc(sub)}${c.id==="alcohol"&&v?` · ${stdGlasses(x)} standaardgla${stdGlasses(x)===1?"s":"zen"}`:""}</small></div>
       <button class="rb" data-act="cnt" data-c="${c.id}" data-n="-1" aria-label="${c.label} min één"${v?"":" disabled"}>−</button>
       <div class="cv">${v}</div>
-      <button class="rb plus" data-act="cnt" data-c="${c.id}" data-n="1" aria-label="${c.label} plus één">+</button></div>`; }).join("")}
+      <button class="rb plus" data-act="${typed?"drinkopen":"cnt"}" data-c="${c.id}" data-n="1" aria-label="${c.label} plus één">${open?"✕":"+"}</button></div>
+      ${open?`<div class="drinkpick"><div class="lab" style="margin-top:0">Wat dronk je?</div>${DRINK_TYPES[c.id].map(t=>`<button data-act="drinkadd" data-c="${c.id}" data-t="${t.id}"><b>${t.l}</b>${t.d?`<small>${t.d}</small>`:""}</button>`).join("")}</div>`:""}`; }).join("")}
   </section>`;
 
   h+=`<section class="tile t-forest"><div class="tl"><span>Hoe at je ${isToday?"vandaag":"die dag"}?</span></div>
@@ -266,7 +346,7 @@ function renderWeek(){
   for(let i=0;i<14;i++){
     const d=addDays(t,-i), x=getDay(d), n=itemCount(x);
     const txt=SLOTS.map(s=>(x.meals[s.id]||[]).map(m=>m.t).join(", ")).filter(Boolean).join(" · ");
-    const extra=COUNTERS.filter(c=>x.count[c.id]).map(c=>x.count[c.id]+" "+c.label.toLowerCase().split(" ")[0]).join(", ");
+    const extra=COUNTERS.filter(c=>x.count[c.id]).map(c=>DRINK_TYPES[c.id]?drinkSummary(x,c.id):x.count[c.id]+" "+c.label.toLowerCase().split(" ")[0]).join(", ");
     const feel=FEELS.find(f=>f[0]===x.feel);
     h+=`<button class="dayrow${n?"":" blank"}" data-act="goto" data-d="${d}">
       <div class="dh"><span class="dn">${i<2?dayName(d):shortDate(d)}${feel?`<span class="pill ${feel[0]}">${feel[1]}</span>`:""}</span><span class="dm">${n?n+" "+(n===1?"ding":"dingen"):"leeg"}</span></div>
@@ -381,7 +461,7 @@ const ACT={
   tab:el=>{ tab=el.dataset.tab; if(tab==="today") viewDay=viewDay||todayStr(); render(); window.scrollTo(0,0); },
   themeflip:()=>{ state.settings.theme=isDark()?"light":"dark"; applyTheme(); save(); render(); },
   theme:el=>{ state.settings.theme=el.dataset.v; applyTheme(); save(); render(); },
-  day:el=>{ const d=addDays(viewDay,+el.dataset.n); if(d<=todayStr()){ viewDay=d; render(); } },
+  day:el=>{ drinkOpen=null; const d=addDays(viewDay,+el.dataset.n); if(d<=todayStr()){ viewDay=d; render(); } },
   goto:el=>{ viewDay=el.dataset.d; tab="today"; render(); window.scrollTo(0,0); },
   add:el=>{ sheet={slot:el.dataset.slot, just:[]}; render(); $("sheet").scrollTop=0; },
   sheetslot:el=>{ sheet.slot=el.dataset.slot; sheet.just=[]; renderSheet(); },
@@ -393,7 +473,15 @@ const ACT={
   pick:el=>{ const t=el.dataset.t; if(addItem(viewDay,sheet.slot,t)){ sheet.just.push(t); render(); } },
   del:el=>{ const x=ensureDay(viewDay), arr=x.meals[el.dataset.slot], i=+el.dataset.i; if(!arr[i]) return; arr.splice(i,1); save(); render(); },
   copy:el=>{ const s=el.dataset.slot; getDay(addDays(viewDay,-1)).meals[s].forEach(m=>addItem(viewDay,s,m.t)); render(); },
-  cnt:el=>{ const x=ensureDay(viewDay), k=el.dataset.c; x.count[k]=Math.max(0,(x.count[k]||0)+(+el.dataset.n)); if(!x.count[k]) delete x.count[k]; save(); render(); },
+  cnt:el=>{ const x=ensureDay(viewDay), k=el.dataset.c, n=+el.dataset.n;
+    if(n<0 && DRINK_TYPES[k]){ // laatst toegevoegde drank weghalen
+      const L=(x.drinks&&x.drinks[k])||[]; if(L.length>=(x.count[k]||0)) L.pop();
+      if(x.drinks && !L.length) delete x.drinks[k]; if(x.drinks && !Object.keys(x.drinks).length) delete x.drinks;
+    }
+    x.count[k]=Math.max(0,(x.count[k]||0)+n); if(!x.count[k]) delete x.count[k]; save(); render(); },
+  drinkopen:el=>{ drinkOpen = drinkOpen===el.dataset.c ? null : el.dataset.c; render(); },
+  drinkadd:el=>{ const x=ensureDay(viewDay), k=el.dataset.c; x.drinks=x.drinks||{}; x.drinks[k]=x.drinks[k]||[];
+    x.drinks[k].push(el.dataset.t); x.count[k]=(x.count[k]||0)+1; drinkOpen=null; save(); render(); },
   feel:el=>{ const x=ensureDay(viewDay); x.feel = x.feel===el.dataset.v ? "" : el.dataset.v; save(); render(); },
   syncsave:async()=>{ const v=($("synctoken")||{}).value||""; if(!v.trim()) return; setSyncCfg({token:v.trim()}); render(); await syncNow(); render(); },
   syncnow:async()=>{ await syncNow(); render(); },
